@@ -7,10 +7,7 @@ use {
     anyhow::Context,
     log::{error, info},
     prost_types::Timestamp,
-    solana_sdk::{
-        clock::{Slot, MAX_RECENT_BLOCKHASHES},
-        pubkey::Pubkey,
-    },
+    solana_sdk::{clock::Slot, pubkey::Pubkey},
     std::{
         collections::{BTreeMap, HashMap},
         sync::{
@@ -22,7 +19,7 @@ use {
     tokio::{
         fs,
         runtime::Builder,
-        sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock, Semaphore},
+        sync::{broadcast, mpsc, oneshot, Mutex, Notify},
         task::spawn_blocking,
         time::{sleep, Duration, Instant},
     },
@@ -51,201 +48,13 @@ use {
             proto::geyser_server::{Geyser, GeyserServer},
         },
         prelude::{
-            CommitmentLevel as CommitmentLevelProto, GetBlockHeightRequest, GetBlockHeightResponse,
-            GetLatestBlockhashRequest, GetLatestBlockhashResponse, GetSlotRequest, GetSlotResponse,
-            GetVersionRequest, GetVersionResponse, IsBlockhashValidRequest,
-            IsBlockhashValidResponse, PingRequest, PongResponse, SubscribeRequest,
+            GetBlockHeightRequest, GetBlockHeightResponse, GetLatestBlockhashRequest,
+            GetLatestBlockhashResponse, GetSlotRequest, GetSlotResponse, GetVersionRequest,
+            GetVersionResponse, IsBlockhashValidRequest, IsBlockhashValidResponse, PingRequest,
+            PongResponse, SubscribeRequest,
         },
     },
 };
-
-#[derive(Debug)]
-struct BlockhashStatus {
-    slot: u64,
-    processed: bool,
-    confirmed: bool,
-    finalized: bool,
-}
-
-impl BlockhashStatus {
-    const fn new(slot: u64) -> Self {
-        Self {
-            slot,
-            processed: false,
-            confirmed: false,
-            finalized: false,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct BlockMetaStorageInner {
-    blocks: HashMap<u64, Arc<MessageBlockMeta>>,
-    blockhashes: HashMap<String, BlockhashStatus>,
-    processed: Option<u64>,
-    confirmed: Option<u64>,
-    finalized: Option<u64>,
-}
-
-#[derive(Debug)]
-struct BlockMetaStorage {
-    read_sem: Semaphore,
-    inner: Arc<RwLock<BlockMetaStorageInner>>,
-}
-
-impl BlockMetaStorage {
-    fn new(unary_concurrency_limit: usize) -> (Self, mpsc::UnboundedSender<Message>) {
-        let inner = Arc::new(RwLock::new(BlockMetaStorageInner::default()));
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        let storage = Arc::clone(&inner);
-        tokio::spawn(async move {
-            const KEEP_SLOTS: u64 = 3;
-
-            while let Some(message) = rx.recv().await {
-                let mut storage = storage.write().await;
-                match message {
-                    Message::Slot(msg) => {
-                        match msg.status {
-                            SlotStatus::Processed => {
-                                storage.processed.replace(msg.slot);
-                            }
-                            SlotStatus::Confirmed => {
-                                storage.confirmed.replace(msg.slot);
-                            }
-                            SlotStatus::Finalized => {
-                                storage.finalized.replace(msg.slot);
-                            }
-                            _ => {}
-                        }
-
-                        if let Some(blockhash) = storage
-                            .blocks
-                            .get(&msg.slot)
-                            .map(|block| block.blockhash.clone())
-                        {
-                            let entry = storage
-                                .blockhashes
-                                .entry(blockhash)
-                                .or_insert_with(|| BlockhashStatus::new(msg.slot));
-
-                            match msg.status {
-                                SlotStatus::Processed => {
-                                    entry.processed = true;
-                                }
-                                SlotStatus::Confirmed => {
-                                    entry.confirmed = true;
-                                }
-                                SlotStatus::Finalized => {
-                                    entry.finalized = true;
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        if msg.status == SlotStatus::Finalized {
-                            if let Some(keep_slot) = msg.slot.checked_sub(KEEP_SLOTS) {
-                                storage.blocks.retain(|slot, _block| *slot >= keep_slot);
-                            }
-
-                            if let Some(keep_slot) =
-                                msg.slot.checked_sub(MAX_RECENT_BLOCKHASHES as u64 + 32)
-                            {
-                                storage
-                                    .blockhashes
-                                    .retain(|_blockhash, status| status.slot >= keep_slot);
-                            }
-                        }
-                    }
-                    Message::BlockMeta(msg) => {
-                        storage.blocks.insert(msg.slot, msg);
-                    }
-                    msg => {
-                        error!("invalid message in BlockMetaStorage: {msg:?}");
-                    }
-                }
-            }
-        });
-
-        (
-            Self {
-                read_sem: Semaphore::new(unary_concurrency_limit),
-                inner,
-            },
-            tx,
-        )
-    }
-
-    fn parse_commitment(commitment: Option<i32>) -> Result<CommitmentLevel, Status> {
-        let commitment = commitment.unwrap_or(CommitmentLevelProto::Processed as i32);
-        CommitmentLevelProto::try_from(commitment)
-            .map(Into::into)
-            .map_err(|_error| {
-                let msg = format!("failed to create CommitmentLevel from {commitment:?}");
-                Status::unknown(msg)
-            })
-    }
-
-    async fn get_block<F, T>(
-        &self,
-        handler: F,
-        commitment: Option<i32>,
-    ) -> Result<Response<T>, Status>
-    where
-        F: FnOnce(&MessageBlockMeta) -> Option<T>,
-    {
-        let commitment = Self::parse_commitment(commitment)?;
-        let _permit = self.read_sem.acquire().await;
-        let storage = self.inner.read().await;
-
-        let slot = match commitment {
-            CommitmentLevel::Processed => storage.processed,
-            CommitmentLevel::Confirmed => storage.confirmed,
-            CommitmentLevel::Finalized => storage.finalized,
-        };
-
-        match slot.and_then(|slot| storage.blocks.get(&slot)) {
-            Some(block) => match handler(block) {
-                Some(resp) => Ok(Response::new(resp)),
-                None => Err(Status::internal("failed to build response")),
-            },
-            None => Err(Status::internal("block is not available yet")),
-        }
-    }
-
-    async fn is_blockhash_valid(
-        &self,
-        blockhash: &str,
-        commitment: Option<i32>,
-    ) -> Result<Response<IsBlockhashValidResponse>, Status> {
-        let commitment = Self::parse_commitment(commitment)?;
-        let _permit = self.read_sem.acquire().await;
-        let storage = self.inner.read().await;
-
-        if storage.blockhashes.len() < MAX_RECENT_BLOCKHASHES + 32 {
-            return Err(Status::internal("startup"));
-        }
-
-        let slot = match commitment {
-            CommitmentLevel::Processed => storage.processed,
-            CommitmentLevel::Confirmed => storage.confirmed,
-            CommitmentLevel::Finalized => storage.finalized,
-        }
-        .ok_or_else(|| Status::internal("startup"))?;
-
-        let valid = storage
-            .blockhashes
-            .get(blockhash)
-            .map(|status| match commitment {
-                CommitmentLevel::Processed => status.processed,
-                CommitmentLevel::Confirmed => status.confirmed,
-                CommitmentLevel::Finalized => status.finalized,
-            })
-            .unwrap_or(false);
-
-        Ok(Response::new(IsBlockhashValidResponse { valid, slot }))
-    }
-}
 
 #[derive(Debug, Default)]
 struct MessageId {
@@ -335,7 +144,6 @@ pub struct GrpcService {
     config_snapshot_client_channel_capacity: usize,
     config_channel_capacity: usize,
     config_filter_limits: Arc<FilterLimits>,
-    blocks_meta: Option<BlockMetaStorage>,
     subscribe_id: AtomicUsize,
     snapshot_rx: Mutex<Option<crossbeam_channel::Receiver<Box<Message>>>>,
     broadcast_tx: broadcast::Sender<BroadcastedMessage>,
@@ -371,15 +179,6 @@ impl GrpcService {
                 (Some(tx), Some(rx))
             }
             _ => (None, None),
-        };
-
-        // Blocks meta storage
-        let (blocks_meta, blocks_meta_tx) = if config.unary_disabled {
-            (None, None)
-        } else {
-            let (blocks_meta, blocks_meta_tx) =
-                BlockMetaStorage::new(config.unary_concurrency_limit);
-            (Some(blocks_meta), Some(blocks_meta_tx))
         };
 
         // Messages to clients combined by commitment
@@ -433,7 +232,6 @@ impl GrpcService {
             config_snapshot_client_channel_capacity: config.snapshot_client_channel_capacity,
             config_channel_capacity: config.channel_capacity,
             config_filter_limits: Arc::new(config.filter_limits),
-            blocks_meta,
             subscribe_id: AtomicUsize::new(0),
             snapshot_rx: Mutex::new(snapshot_rx),
             broadcast_tx: broadcast_tx.clone(),
@@ -468,7 +266,6 @@ impl GrpcService {
                 .expect("Failed to create a new runtime for geyser loop")
                 .block_on(Self::geyser_loop(
                     messages_rx,
-                    blocks_meta_tx,
                     broadcast_tx,
                     replay_stored_slots_rx,
                     config.replay_stored_slots,
@@ -505,7 +302,6 @@ impl GrpcService {
 
     async fn geyser_loop(
         mut messages_rx: mpsc::UnboundedReceiver<Message>,
-        blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
         broadcast_tx: broadcast::Sender<BroadcastedMessage>,
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_stored_slots: u64,
@@ -531,13 +327,6 @@ impl GrpcService {
                     // Update metrics
                     if let Message::Slot(slot_message) = &message {
                         metrics::update_slot_plugin_status(slot_message.status, slot_message.slot);
-                    }
-
-                    // Update blocks info
-                    if let Some(blocks_meta_tx) = &blocks_meta_tx {
-                        if matches!(&message, Message::Slot(_) | Message::BlockMeta(_)) {
-                            let _ = blocks_meta_tx.send(message.clone());
-                        }
                     }
 
                     // Remove outdated block reconstruction info
@@ -1216,75 +1005,30 @@ impl Geyser for GrpcService {
 
     async fn get_latest_blockhash(
         &self,
-        request: Request<GetLatestBlockhashRequest>,
+        _request: Request<GetLatestBlockhashRequest>,
     ) -> Result<Response<GetLatestBlockhashResponse>, Status> {
-        if let Some(blocks_meta) = &self.blocks_meta {
-            blocks_meta
-                .get_block(
-                    |block| {
-                        block.block_height.map(|value| GetLatestBlockhashResponse {
-                            slot: block.slot,
-                            blockhash: block.blockhash.clone(),
-                            last_valid_block_height: value.block_height
-                                + MAX_RECENT_BLOCKHASHES as u64,
-                        })
-                    },
-                    request.get_ref().commitment,
-                )
-                .await
-        } else {
-            Err(Status::unimplemented("method disabled"))
-        }
+        Err(Status::unimplemented("method disabled"))
     }
 
     async fn get_block_height(
         &self,
-        request: Request<GetBlockHeightRequest>,
+        _request: Request<GetBlockHeightRequest>,
     ) -> Result<Response<GetBlockHeightResponse>, Status> {
-        if let Some(blocks_meta) = &self.blocks_meta {
-            blocks_meta
-                .get_block(
-                    |block| {
-                        block.block_height.map(|value| GetBlockHeightResponse {
-                            block_height: value.block_height,
-                        })
-                    },
-                    request.get_ref().commitment,
-                )
-                .await
-        } else {
-            Err(Status::unimplemented("method disabled"))
-        }
+        Err(Status::unimplemented("method disabled"))
     }
 
     async fn get_slot(
         &self,
-        request: Request<GetSlotRequest>,
+        _request: Request<GetSlotRequest>,
     ) -> Result<Response<GetSlotResponse>, Status> {
-        if let Some(blocks_meta) = &self.blocks_meta {
-            blocks_meta
-                .get_block(
-                    |block| Some(GetSlotResponse { slot: block.slot }),
-                    request.get_ref().commitment,
-                )
-                .await
-        } else {
-            Err(Status::unimplemented("method disabled"))
-        }
+        Err(Status::unimplemented("method disabled"))
     }
 
     async fn is_blockhash_valid(
         &self,
-        request: Request<IsBlockhashValidRequest>,
+        _request: Request<IsBlockhashValidRequest>,
     ) -> Result<Response<IsBlockhashValidResponse>, Status> {
-        if let Some(blocks_meta) = &self.blocks_meta {
-            let req = request.get_ref();
-            blocks_meta
-                .is_blockhash_valid(&req.blockhash, req.commitment)
-                .await
-        } else {
-            Err(Status::unimplemented("method disabled"))
-        }
+        Err(Status::unimplemented("method disabled"))
     }
 
     async fn get_version(

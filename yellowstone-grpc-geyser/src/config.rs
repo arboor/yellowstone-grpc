@@ -172,9 +172,6 @@ pub struct ConfigGrpc {
         deserialize_with = "deserialize_int_str"
     )]
     pub unary_concurrency_limit: usize,
-    /// Enable/disable unary methods
-    #[serde(default)]
-    pub unary_disabled: bool,
     /// Limits for possible filters
     #[serde(default, alias = "filters")]
     pub filter_limits: FilterLimits,
